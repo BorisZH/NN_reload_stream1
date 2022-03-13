@@ -20,14 +20,18 @@ class DatasetSeq(Dataset):
 
         self.target_vocab = {}
         self.word_vocab = {}
+        self.char_vocab = {}
 
         self.encoded_sequences = []
         self.encoded_targets = []
+        self.encoded_char_sequences = []
         n_word = 0
         n_target = 0
+        n_char = 0
         for line in train:
             sequence = []
             target = []
+            chars = []
             for item in line.split('\n'):
                 if item != '':
                     word, label = item.split(' ')
@@ -38,11 +42,16 @@ class DatasetSeq(Dataset):
                     if self.target_vocab.get(label) is None:
                         self.target_vocab[label] = n_target
                         n_target += 1
-
+                    for char in word:
+                        if self.char_vocab.get(char) is None:
+                            self.char_vocab[char] = n_char
+                            n_char += 1
                     sequence.append(self.word_vocab[word])
                     target.append(self.target_vocab[label])
+                    chars.append([self.char_vocab[char] for char in word])
             self.encoded_sequences.append(sequence)
             self.encoded_targets.append(target)
+            self.encoded_char_sequences.append(chars)
 
     def __len__(self):
         return len(self.encoded_sequences)
@@ -50,6 +59,7 @@ class DatasetSeq(Dataset):
     def __getitem__(self, index):
         return {
             'data': torch.tensor(self.encoded_sequences[index]),
+            'char': torch.tensor(self.encoded_char_sequences[index]),
             'target': torch.tensor(self.encoded_targets[index]),
         }
 
@@ -58,32 +68,65 @@ dataset = DatasetSeq(data_dir)
 #hyper params
 vocab_len = len(dataset.word_vocab)
 n_classes = len(dataset.target_vocab)
+n_chars = len(dataset.char_vocab)
 cuda_device = -1
 batch_size = 1
 device = f'cuda:{cuda_device}' if cuda_device != -1 else 'cpu'
 
 
 #model
-class POS_predictor(nn.Module):
-    def __init__(self, word_vocab_len: int, n_classes: int, emb_size: int = 128, hidden_size: int = 128):
+class CharModel(nn.Module):
+    def __init__(self, char_vocab_len: int, emb_size: int = 128, hidden_size: int = 128):
         super().__init__()
-        self.word_emb = nn.Embedding(emb_size, word_vocab_len)
-        self.gru = nn.GRU(input_size=emb_size, hidden_size=hidden_size, batch_first=True)
-        self.classifier = nn.Linear(hidden_size, n_classes)
+        self.char_emb = nn.Embedding(char_vocab_len, emb_size)
+        self.char_gru = nn.GRU(input_size=emb_size, hidden_size=hidden_size, batch_first=True)
 
     def forward(self, x):
+        embed = self.char_emb(x)
+        _, out = self.char_gru(embed)
+
+        return out
+
+
+class POS_predictor(nn.Module):
+    def __init__(self,
+                 word_vocab_len: int,
+                 n_classes: int,
+                 char_vocab_len: int,
+                 emb_size: int = 128,
+                 hidden_size: int = 128,
+                 char_emb_size: int = 64,
+                 char_hidden_size: int = 64,
+                 ):
+        super().__init__()
+        self.word_emb = nn.Embedding(word_vocab_len, emb_size)
+        self.char_rnn = CharModel(char_vocab_len=char_vocab_len, emb_size=char_emb_size, hidden_size=char_hidden_size)
+
+        self.gru = nn.GRU(input_size=emb_size+char_hidden_size, hidden_size=hidden_size, batch_first=True)
+        self.classifier = nn.Linear(hidden_size, n_classes)
+
+    def forward(self, x, chars):
+        n_words = x.size(1)
+        chars_out = []
+        for id_ in range(n_words):
+            # B x T x C
+            input_t = chars[:, id_, :].squeeze()
+            #B x 1 x C_emb
+            chars_out.append(self.char_rnn(input_t).unsqueeze(1))
+        # B x T x C_emb
+        chars_out = torch.cat(chars_out, dim=1)
         embedded = self.word_emb(x)
-        out, _ = self.gru(embedded)
+        out, _ = self.gru(torch.cat([embedded, chars_out], dim=-1))
 
         return self.classifier(out)
 
 
 def collate_fn(data):
 
-    return data
+    return data[0]
 
 
-model = POS_predictor(vocab_len, n_classes)
+model = POS_predictor(vocab_len, n_classes, n_chars)
 #optimizer
 optim = torch.optim.Adam(model.parameters(), lr=0.001)
 #lr scheduler
